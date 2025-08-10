@@ -149,24 +149,88 @@ def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_
     # 2. Feature Engineering: Extract car brand
     if 'CarName' in df.columns:
         df['carbrand'] = df['CarName'].apply(lambda x: x.split(' ')[0])
+        data['cartype'] = data['CarName'].apply(lambda x: ' '.join(x.split(' ')[1:]) if len(x.split(' ')) > 1 else 'unknown')
         df = df.drop(columns=['CarName'])
 
     # 3. One-Hot Encode categorical features
-    categorical_cols = ['fueltype', 'aspiration', 'doornumber', 'carbody', 'drivewheel', 'enginelocation', 'enginetype', 'cylindernumber', 'fuelsystem', 'carbrand']
+    target_encoded_features = ['cartype', 'carbrand']  
+    ordinal_features = ['fueltype', 'aspiration', 'doornumber', 'carbody', 'drivewheel', 'enginelocation', 'cylindernumber', 'fuelsystem', 'enginetype']
+    numerical_features = ['wheelbase', 'carheight', 'horsepower', 'peakrpm', 'citympg']
     cols_to_encode = [col for col in categorical_cols if col in df.columns]
     df_encoded = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
+    target_encoder = ce.TargetEncoder(cols=target_encoded_features)
+    ordinal_encoder = ce.OrdinalEncoder(cols=ordinal_features)
+    scaler = StandardScaler()
 
-    # 4. Align columns with the training data (crucial step!)
-    # This ensures all required columns are present and in the correct order, filling missing ones with 0.
-    df_aligned = df_encoded.reindex(columns=model_features, fill_value=0)
+# intersect with present columns
+    target_encoded_features = [c for c in target_encoded_features if c in df.columns]
+    ordinal_features = [c for c in ordinal_features if c in df.columns]
+    numerical_features = [c for c in numerical_features if c in df.columns]
 
-    # 5. Scale numerical features using the loaded scaler
-    numerical_cols = ['wheelbase', 'carheight', 'horsepower', 'peakrpm', 'citympg']
-    cols_to_scale = [col for col in numerical_cols if col in df_aligned.columns]
-    if cols_to_scale:
-        df_aligned[cols_to_scale] = scaler.transform(df_aligned[cols_to_scale])
+    # 4. Handle missing values
+    # For numerical: simple impute with median (safe default for batch predict)
+    for col in numerical_features:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        df[col] = df[col].fillna(df[col].median())
 
-    return df_aligned
+    # For categorical: fillna with 'missing'
+    categorical_cols = list(set(target_encoded_features + ordinal_features))
+    for col in categorical_cols:
+        df[col] = df[col].fillna('missing').astype(str).str.lower()
+
+    # 5. Apply encoders if provided, else fall back to one-hot encoding
+    encoded_df = df.copy()
+
+    # If target/ordinal encoders are provided, transform them (they must be pre-fit)
+    try:
+        if target_encoder is not None and len(target_encoded_features) > 0:
+            encoded_df[target_encoded_features] = target_encoder.transform(encoded_df[target_encoded_features])
+    except Exception:
+        # fallback: leave the original columns for one-hot below
+        pass
+
+    try:
+        if ordinal_encoder is not None and len(ordinal_features) > 0:
+            encoded_df[ordinal_features] = ordinal_encoder.transform(encoded_df[ordinal_features])
+    except Exception:
+        # fallback: leave the original columns for one-hot below
+        pass
+
+    # Decide which columns remain categorical (those not transformed numerically by provided encoders)
+    # If encoders were used and produced numeric columns, they are already numeric in encoded_df.
+    # We'll one-hot encode any remaining object/dtype 'category' columns among categorical_cols.
+    cols_for_ohe = [c for c in categorical_cols if encoded_df[c].dtype == object or encoded_df[c].dtype.name == 'category']
+    if len(cols_for_ohe) > 0:
+        encoded_df = pd.get_dummies(encoded_df, columns=cols_for_ohe, drop_first=True)
+
+    # 6. Scale numerical features using provided scaler (assumed fitted)
+    # If scaler is None, we will not scale but warn by using identity.
+    if scaler is not None:
+        num_cols_present = [c for c in numerical_features if c in encoded_df.columns]
+        if len(num_cols_present) > 0:
+            # scaler expects 2D array with columns in a consistent order: use num_cols_present
+            try:
+                encoded_df[num_cols_present] = scaler.transform(encoded_df[num_cols_present])
+            except Exception as e:
+                raise ValueError(f"Scaler transform failed: {e}")
+    else:
+        # no scaler provided: leave numericals as-is
+        pass
+
+    # 7. Ensure final columns match model_features: add missing cols filled with 0, and drop extras
+    final_df = encoded_df.copy()
+
+    # Ensure all model_features present
+    for col in model_features:
+        if col not in final_df.columns:
+            # create missing column with zeros
+            final_df[col] = 0
+
+    # Keep only model_features and preserve order
+    final_df = final_df[model_features]
+
+    # Return final DataFrame ready for model.predict
+    return final_df
 
 # --- Blocking Inference Function ---
 def blocking_batch_inference(
