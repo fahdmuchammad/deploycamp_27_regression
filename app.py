@@ -83,7 +83,7 @@ os.environ['AWS_ACCESS_KEY_ID'] = os.getenv("AWS_ACCESS_KEY_ID", "")
 os.environ['AWS_SECRET_ACCESS_KEY'] = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 os.environ['MLFLOW_S3_ENDPOINT_URL'] = os.getenv("MLFLOW_S3_ENDPOINT_URL", "")
 
-MODEL_NAME = "RandomForestRegressor"
+MODEL_NAME = "xgboost_regressor"
 MODEL_STAGE = "prod"
 
 # Global variables to hold the loaded model and its artifacts
@@ -91,6 +91,8 @@ model = None
 scaler = None
 model_features = None
 model_mae = None
+target_encoder = None  
+ordinal_encoder = None 
 
 # --- Model Loading on Startup ---
 @app.on_event("startup")
@@ -99,27 +101,36 @@ def load_model_and_artifacts():
     Loads the model, scaler, and feature list from the MLflow Model Registry.
     This function is executed when the FastAPI application starts.
     """
-    global model, scaler, model_features, model_mae
-    model_uri = f"models:/{MODEL_NAME}@{MODEL_STAGE}"
-    logging.info(f"Attempting to load model and artifacts from URI: {model_uri}")
+    global model, scaler, model_features, model_mae, target_encoder, ordinal_encoder
+
+    client = MlflowClient()
+
+    model_version_details = client.get_model_version_by_alias(MODEL_NAME, MODEL_STAGE)
+    model_source_uri = model_version_details.source.split('models:/')[1]
+    logging.info(f"Attempting to load model and artifacts from URI: {model_source_uri}")
 
     try:
-        model = mlflow.pyfunc.load_model(model_uri)
+        model = mlflow.pyfunc.load_model(model_source_uri)
         logging.info(f"Model '{MODEL_NAME}@{MODEL_STAGE}' loaded successfully.")
 
-        client = MlflowClient()
         model_version_details = client.get_model_version_by_alias(MODEL_NAME, MODEL_STAGE)
         run_id = model_version_details.run_id
         logging.info(f"Associated Run ID: {run_id}")
 
         # Download artifacts associated with the model's run
-        scaler_path = client.download_artifacts(run_id, "scaler.pkl")
+        scaler_path = client.download_artifacts(run_id, "scaler.sav")
         features_path = client.download_artifacts(run_id, "model_features.json")
+        target_encoder_path = client.download_artifacts(run_id, "target_encoder.pkl")
+        ordinal_encoder_path = client.download_artifacts(run_id, "ordinal_encoder.pkl")
 
         with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
         with open(features_path, "r") as f:
             model_features = json.load(f)
+        with open(target_encoder_path, "rb") as f:
+            target_encoder = pickle.load(f) 
+        with open(ordinal_encoder_path, "rb") as f:
+            ordinal_encoder = pickle.load(f)
 
         logging.info("Scaler and model features loaded successfully.")
 
@@ -139,7 +150,7 @@ def load_model_and_artifacts():
         model_performance_gauge.set(0.0)
 
 # --- Data Preprocessing for Batch Input ---
-def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_features: list) -> pd.DataFrame:
+def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_features: list, target_encoder, ordinal_encoder) -> pd.DataFrame:
     """Preprocesses a DataFrame of raw car features for prediction."""
     
     # 1. Drop columns not used in training
@@ -149,7 +160,7 @@ def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_
     # 2. Feature Engineering: Extract car brand
     if 'CarName' in df.columns:
         df['carbrand'] = df['CarName'].apply(lambda x: x.split(' ')[0])
-        data['cartype'] = data['CarName'].apply(lambda x: ' '.join(x.split(' ')[1:]) if len(x.split(' ')) > 1 else 'unknown')
+        df['cartype'] = df['CarName'].apply(lambda x: ' '.join(x.split(' ')[1:]) if len(x.split(' ')) > 1 else 'unknown')
         df = df.drop(columns=['CarName'])
 
     # 3. One-Hot Encode categorical features
@@ -158,9 +169,6 @@ def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_
     numerical_features = ['wheelbase', 'carheight', 'horsepower', 'peakrpm', 'citympg']
     cols_to_encode = [col for col in categorical_cols if col in df.columns]
     df_encoded = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
-    target_encoder = ce.TargetEncoder(cols=target_encoded_features)
-    ordinal_encoder = ce.OrdinalEncoder(cols=ordinal_features)
-    scaler = StandardScaler()
 
 # intersect with present columns
     target_encoded_features = [c for c in target_encoded_features if c in df.columns]
@@ -237,10 +245,12 @@ def blocking_batch_inference(
     model_instance,
     scaler_instance: StandardScaler,
     features_list: list,
+    target_encoder,      
+    ordinal_encoder,         
     input_dataframe: pd.DataFrame
 ) -> List[Dict[str, Any]]:
     """Performs preprocessing and prediction for a batch of data."""
-    processed_df = preprocess_batch_data(input_dataframe, scaler_instance, features_list)
+    processed_df = preprocess_batch_data(input_dataframe, scaler_instance, features_list, target_encoder, ordinal_encoder)
     predictions = model_instance.predict(processed_df)
     results = [{"predicted_price": float(price)} for price in predictions]
     return results
@@ -271,7 +281,7 @@ async def predict(car_batch: List[CarFeatures]):
 
         # Execute the blocking inference function in a separate thread
         results = await run_in_threadpool(
-            blocking_batch_inference, model, scaler, model_features, input_df
+            blocking_batch_inference, model, scaler, model_features, input_df, target_encoder, ordinal_encoder
         )
 
         # Update Prometheus metrics for each prediction
