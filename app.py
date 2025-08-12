@@ -107,10 +107,11 @@ def load_model_and_artifacts():
 
     model_version_details = client.get_model_version_by_alias(MODEL_NAME, MODEL_STAGE)
     model_source_uri = model_version_details.source.split('models:/')[1]
-    logging.info(f"Attempting to load model and artifacts from URI: {model_source_uri}")
+    model_path = f's3://mlflow/1/models/{model_source_uri}/artifacts'
+    logging.info(f"Attempting to load model and artifacts from URI: {model_path}")
 
     try:
-        model = mlflow.pyfunc.load_model(model_source_uri)
+        model = mlflow.pyfunc.load_model(model_path)
         logging.info(f"Model '{MODEL_NAME}@{MODEL_STAGE}' loaded successfully.")
 
         model_version_details = client.get_model_version_by_alias(MODEL_NAME, MODEL_STAGE)
