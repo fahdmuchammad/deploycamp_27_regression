@@ -23,8 +23,6 @@ logging.basicConfig(
 
 # --- Pydantic Model for Input Data ---
 class CarFeatures(BaseModel):
-    car_ID: int
-    symboling: int
     CarName: str
     fueltype: str
     aspiration: str
@@ -33,21 +31,13 @@ class CarFeatures(BaseModel):
     drivewheel: str
     enginelocation: str
     wheelbase: float
-    carlength: float
-    carwidth: float
     carheight: float
-    curbweight: int
     enginetype: str
     cylindernumber: str
-    enginesize: int
     fuelsystem: str
-    boreratio: float
-    stroke: float
-    compressionratio: float
     horsepower: int
     peakrpm: int
     citympg: int
-    highwaympg: int
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -106,8 +96,8 @@ def load_model_and_artifacts():
     client = MlflowClient()
 
     model_version_details = client.get_model_version_by_alias(MODEL_NAME, MODEL_STAGE)
-    model_source_uri = model_version_details.source.split('models:/')[1]
-    model_path = f's3://mlflow/1/models/{model_source_uri}/artifacts'
+    #model_source_uri = model_version_details.source.split('models:/')[1]
+    model_path = f's3://mlflow/1/models/{model_version_details.run_id}/artifacts/car_price_model'
     logging.info(f"Attempting to load model and artifacts from URI: {model_path}")
 
     try:
@@ -121,8 +111,8 @@ def load_model_and_artifacts():
         # Download artifacts associated with the model's run
         scaler_path = client.download_artifacts(run_id, "scaler.sav")
         features_path = client.download_artifacts(run_id, "model_features.json")
-        target_encoder_path = client.download_artifacts(run_id, "target_encoder.pkl")
-        ordinal_encoder_path = client.download_artifacts(run_id, "ordinal_encoder.pkl")
+        target_encoder_path = client.download_artifacts(run_id, "target_encoder.sav")
+        ordinal_encoder_path = client.download_artifacts(run_id, "ordinal_encoder.sav")
 
         with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
@@ -166,10 +156,10 @@ def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_
 
     # 3. One-Hot Encode categorical features
     target_encoded_features = ['cartype', 'carbrand']  
-    ordinal_features = ['fueltype', 'aspiration', 'doornumber', 'carbody', 'drivewheel', 'enginelocation', 'cylindernumber', 'fuelsystem', 'enginetype']
+    ordinal_features = ['fueltype', 'aspiration', 'doornumber', 'carbody', 'drivewheel', 'cylindernumber', 'fuelsystem', 'enginetype']
     numerical_features = ['wheelbase', 'carheight', 'horsepower', 'peakrpm', 'citympg']
-    cols_to_encode = [col for col in categorical_cols if col in df.columns]
-    df_encoded = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
+    #cols_to_encode = [col for col in categorical_cols if col in df.columns]
+    #df_encoded = pd.get_dummies(df, columns=cols_to_encode, drop_first=True)
 
 # intersect with present columns
     target_encoded_features = [c for c in target_encoded_features if c in df.columns]
@@ -225,7 +215,7 @@ def preprocess_batch_data(input_df: pd.DataFrame, scaler: StandardScaler, model_
     else:
         # no scaler provided: leave numericals as-is
         pass
-
+    
     # 7. Ensure final columns match model_features: add missing cols filled with 0, and drop extras
     final_df = encoded_df.copy()
 
@@ -282,7 +272,7 @@ async def predict(car_batch: List[CarFeatures]):
 
         # Execute the blocking inference function in a separate thread
         results = await run_in_threadpool(
-            blocking_batch_inference, model, scaler, model_features, input_df, target_encoder, ordinal_encoder
+            blocking_batch_inference, model, scaler, model_features, target_encoder, ordinal_encoder, input_df
         )
 
         # Update Prometheus metrics for each prediction
